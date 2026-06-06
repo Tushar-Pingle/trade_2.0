@@ -48,6 +48,13 @@ class HyperliquidAPI:
         """
         self._meta_cache = None
         self._hip3_meta_cache = {}  # {dex_name: meta_response}
+        self.paper_mode = bool(CONFIG.get("paper_mode"))
+        # Paper-mode simulated state (only used when paper_mode is True)
+        self._paper_positions = {}  # {asset: {"szi": float, "entryPx": float}}
+        self._paper_orders = {}  # {oid: {"coin","isBuy","sz","px","triggerPx","orderType"}}
+        self._paper_fills = []  # list of fill dicts (most recent appended)
+        self._paper_next_oid = 1_000_000_000
+        self._paper_balance = float(CONFIG.get("paper_starting_balance") or 10000.0)
         if "hyperliquid_private_key" in CONFIG and CONFIG["hyperliquid_private_key"]:
             self.wallet = Account.from_key(CONFIG["hyperliquid_private_key"])
         elif "mnemonic" in CONFIG and CONFIG["mnemonic"]:
@@ -130,6 +137,53 @@ class HyperliquidAPI:
                 break
         raise last_err if last_err else RuntimeError("Hyperliquid retry: unknown error")
 
+    def _next_paper_oid(self):
+        """Allocate a unique synthetic order id for paper-mode responses."""
+        oid = self._paper_next_oid
+        self._paper_next_oid += 1
+        return oid
+
+    def _paper_response(self, oid, resting=True):
+        """Return an SDK-shaped order response dict for paper-mode orders."""
+        status = {"resting" if resting else "filled": {"oid": oid}}
+        return {"status": "ok", "response": {"data": {"statuses": [status]}}}
+
+    async def _paper_apply_fill(self, asset, is_buy, amount):
+        """Update paper position state to reflect a synthetic market fill.
+
+        Combined entry price uses size-weighted average when scaling into an
+        existing same-direction position. Opposite-direction fills net the size.
+        """
+        price = await self.get_current_price(asset)
+        if price is None or price <= 0:
+            raise RuntimeError(f"Paper fill aborted for {asset}: no price")
+        pos = self._paper_positions.get(asset) or {"szi": 0.0, "entryPx": 0.0}
+        old_szi = float(pos.get("szi", 0.0))
+        old_entry = float(pos.get("entryPx", 0.0) or 0.0)
+        delta = float(amount) if is_buy else -float(amount)
+        new_szi = old_szi + delta
+        if old_szi == 0 or (old_szi > 0) != (new_szi > 0) or new_szi == 0:
+            # New position, fully closed, or flipped through zero — reset entry
+            new_entry = price if new_szi != 0 else 0.0
+        elif (old_szi > 0) == (delta > 0):
+            # Same-direction scale-in: size-weighted average
+            new_entry = ((abs(old_szi) * old_entry) + (abs(delta) * price)) / abs(new_szi)
+        else:
+            # Same-direction reduce: keep original entry
+            new_entry = old_entry
+        self._paper_positions[asset] = {"szi": new_szi, "entryPx": new_entry}
+        self._paper_fills.append({
+            "coin": asset,
+            "isBuy": is_buy,
+            "sz": abs(float(amount)),
+            "px": price,
+            "time": int(asyncio.get_event_loop().time() * 1000),
+        })
+        # Cap fill history
+        if len(self._paper_fills) > 200:
+            self._paper_fills = self._paper_fills[-200:]
+        return price
+
     def round_size(self, asset, amount):
         """Round order size to the asset precision defined by market metadata.
 
@@ -173,6 +227,9 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
+        if self.paper_mode:
+            await self._paper_apply_fill(asset, True, amount)
+            return self._paper_response(self._next_paper_oid(), resting=False)
         return await self._retry(lambda: self.exchange.market_open(asset, True, amount, None, slippage))
 
     async def place_sell_order(self, asset, amount, slippage=0.01):
@@ -187,6 +244,9 @@ class HyperliquidAPI:
             Raw SDK response from :meth:`Exchange.market_open`.
         """
         amount = self.round_size(asset, amount)
+        if self.paper_mode:
+            await self._paper_apply_fill(asset, False, amount)
+            return self._paper_response(self._next_paper_oid(), resting=False)
         return await self._retry(lambda: self.exchange.market_open(asset, False, amount, None, slippage))
 
     async def place_limit_buy(self, asset, amount, limit_price, tif="Gtc"):
@@ -204,6 +264,13 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"limit": {"tif": tif}}
+        if self.paper_mode:
+            oid = self._next_paper_oid()
+            self._paper_orders[oid] = {
+                "coin": asset, "isBuy": True, "sz": amount,
+                "px": limit_price, "orderType": order_type
+            }
+            return self._paper_response(oid, resting=True)
         return await self._retry(lambda: self.exchange.order(asset, True, amount, limit_price, order_type))
 
     async def place_limit_sell(self, asset, amount, limit_price, tif="Gtc"):
@@ -220,6 +287,13 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"limit": {"tif": tif}}
+        if self.paper_mode:
+            oid = self._next_paper_oid()
+            self._paper_orders[oid] = {
+                "coin": asset, "isBuy": False, "sz": amount,
+                "px": limit_price, "orderType": order_type
+            }
+            return self._paper_response(oid, resting=True)
         return await self._retry(lambda: self.exchange.order(asset, False, amount, limit_price, order_type))
 
     async def place_take_profit(self, asset, is_buy, amount, tp_price):
@@ -237,6 +311,13 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
+        if self.paper_mode:
+            oid = self._next_paper_oid()
+            self._paper_orders[oid] = {
+                "coin": asset, "isBuy": not is_buy, "sz": amount,
+                "px": tp_price, "triggerPx": tp_price, "orderType": order_type
+            }
+            return self._paper_response(oid, resting=True)
         return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, tp_price, order_type, True))
 
     async def place_stop_loss(self, asset, is_buy, amount, sl_price):
@@ -254,6 +335,13 @@ class HyperliquidAPI:
         """
         amount = self.round_size(asset, amount)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
+        if self.paper_mode:
+            oid = self._next_paper_oid()
+            self._paper_orders[oid] = {
+                "coin": asset, "isBuy": not is_buy, "sz": amount,
+                "px": sl_price, "triggerPx": sl_price, "orderType": order_type
+            }
+            return self._paper_response(oid, resting=True)
         return await self._retry(lambda: self.exchange.order(asset, not is_buy, amount, sl_price, order_type, True))
 
     async def cancel_order(self, asset, oid):
@@ -266,10 +354,18 @@ class HyperliquidAPI:
         Returns:
             Raw SDK response from :meth:`Exchange.cancel`.
         """
+        if self.paper_mode:
+            self._paper_orders.pop(oid, None)
+            return {"status": "ok"}
         return await self._retry(lambda: self.exchange.cancel(asset, oid))
 
     async def cancel_all_orders(self, asset):
         """Cancel every open order for ``asset`` owned by the configured wallet."""
+        if self.paper_mode:
+            to_drop = [oid for oid, o in self._paper_orders.items() if o.get("coin") == asset]
+            for oid in to_drop:
+                self._paper_orders.pop(oid, None)
+            return {"status": "ok", "cancelled_count": len(to_drop)}
         try:
             open_orders = await self._retry(lambda: self.info.frontend_open_orders(self.query_address))
             for order in open_orders:
@@ -288,6 +384,11 @@ class HyperliquidAPI:
         Returns:
             List of order dictionaries augmented with ``triggerPx`` when present.
         """
+        if self.paper_mode:
+            orders = []
+            for oid, o in self._paper_orders.items():
+                orders.append({**o, "oid": oid})
+            return orders
         try:
             orders = await self._retry(lambda: self.info.frontend_open_orders(self.query_address))
             # Normalize trigger price if present in orderType
@@ -314,6 +415,8 @@ class HyperliquidAPI:
         Returns:
             List of fill dictionaries or an empty list if unsupported.
         """
+        if self.paper_mode:
+            return self._paper_fills[-limit:]
         try:
             # Some SDK versions expose user_fills; fall back gracefully if absent
             if hasattr(self.info, 'user_fills'):
@@ -359,6 +462,35 @@ class HyperliquidAPI:
         Returns:
             Dictionary with ``balance``, ``total_value``, and ``positions``.
         """
+        if self.paper_mode:
+            # Paper mode: synthesize state from in-memory simulated positions.
+            paper_positions = []
+            for asset, pp in self._paper_positions.items():
+                szi = float(pp.get("szi", 0.0))
+                if szi == 0:
+                    continue
+                entry_px = float(pp.get("entryPx", 0.0) or 0.0)
+                current_px = await self.get_current_price(asset)
+                if current_px is None or current_px <= 0:
+                    pnl = None
+                    price_unavailable = True
+                else:
+                    pnl = (current_px - entry_px) * abs(szi) if szi > 0 else (entry_px - current_px) * abs(szi)
+                    price_unavailable = False
+                pos = {
+                    "coin": asset,
+                    "szi": szi,
+                    "entryPx": entry_px,
+                    "pnl": pnl,
+                    "notional_entry": abs(szi) * entry_px,
+                    "leverage": {"value": 1, "type": "cross"},
+                }
+                if price_unavailable:
+                    pos["price_unavailable"] = True
+                paper_positions.append(pos)
+            balance = float(self._paper_balance)
+            total_value = balance + sum(p["pnl"] for p in paper_positions if p.get("pnl") is not None)
+            return {"balance": balance, "total_value": total_value, "positions": paper_positions}
         state = await self._retry(lambda: self.info.user_state(self.query_address))
         positions = state.get("assetPositions", [])
         total_value = float(state.get("accountValue", 0.0))
@@ -368,9 +500,13 @@ class HyperliquidAPI:
             entry_px = float(pos.get("entryPx", 0) or 0)
             size = float(pos.get("szi", 0) or 0)
             side = "long" if size > 0 else "short"
-            current_px = await self.get_current_price(pos["coin"]) if entry_px and size else 0.0
-            pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
-            pos["pnl"] = pnl
+            current_px = await self.get_current_price(pos["coin"]) if entry_px and size else None
+            if current_px is None or current_px <= 0:
+                pos["pnl"] = None
+                pos["price_unavailable"] = True
+            else:
+                pnl = (current_px - entry_px) * abs(size) if side == "long" else (entry_px - current_px) * abs(size)
+                pos["pnl"] = pnl
             pos["notional_entry"] = abs(size) * entry_px
             enriched_positions.append(pos)
         balance = float(state.get("withdrawable", 0.0))
@@ -387,13 +523,13 @@ class HyperliquidAPI:
                         spot_total = float(bal.get("total", 0))
                         spot_hold = float(bal.get("hold", 0))
                         balance = spot_total - spot_hold
-                        total_value = balance + sum(p.get("pnl", 0.0) for p in enriched_positions)
+                        total_value = balance + sum(p["pnl"] for p in enriched_positions if p.get("pnl") is not None)
                         break
             except Exception as e:
                 logging.warning("Failed to fetch spot state for unified account: %s", e)
 
         if not total_value:
-            total_value = balance + sum(max(p.get("pnl", 0.0), 0.0) for p in enriched_positions)
+            total_value = balance + sum(max(p["pnl"], 0.0) for p in enriched_positions if p.get("pnl") is not None)
         return {"balance": balance, "total_value": total_value, "positions": enriched_positions}
 
     async def get_current_price(self, asset):
@@ -407,17 +543,34 @@ class HyperliquidAPI:
             asset: Market symbol to query.
 
         Returns:
-            Mid-price as a float, or ``0.0`` when unavailable.
+            Mid-price as a float, or ``None`` when unavailable (asset missing
+            from feed, SDK KeyError on HIP-3 lookup, or zero-priced).
         """
-        if ":" in asset:
-            # HIP-3 asset — need dex-specific allMids
-            dex = asset.split(":")[0]
-            mids = await self._retry(
-                lambda: self.info.post("/info", {"type": "allMids", "dex": dex})
-            )
-        else:
-            mids = await self._retry(self.info.all_mids)
-        return float(mids.get(asset, 0.0))
+        is_hip3 = ":" in asset
+        try:
+            if is_hip3:
+                dex = asset.split(":")[0]
+                mids = await self._retry(
+                    lambda: self.info.post("/info", {"type": "allMids", "dex": dex})
+                )
+            else:
+                mids = await self._retry(self.info.all_mids)
+        except KeyError as e:
+            logging.warning("Price fetch KeyError for %s (hip3=%s): %s", asset, is_hip3, e)
+            return None
+        if not isinstance(mids, dict) or asset not in mids:
+            logging.warning("Price unavailable for %s (hip3=%s, mids_count=%s)",
+                            asset, is_hip3, len(mids) if isinstance(mids, dict) else "n/a")
+            return None
+        try:
+            price = float(mids[asset])
+        except (TypeError, ValueError):
+            logging.warning("Price for %s not parseable: %r", asset, mids.get(asset))
+            return None
+        if price <= 0:
+            logging.warning("Price for %s is non-positive: %s", asset, price)
+            return None
+        return price
 
     async def get_meta_and_ctxs(self, dex=None):
         """Return cached meta/context information, fetching once per lifecycle.
@@ -430,13 +583,15 @@ class HyperliquidAPI:
         """
         if dex:
             if dex not in self._hip3_meta_cache:
-                response = await self._retry(
-                    lambda: self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
-                )
+                try:
+                    response = await self._retry(
+                        lambda: self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+                    )
+                except KeyError as e:
+                    logging.warning("HIP-3 meta KeyError for dex %s: %s", dex, e)
+                    return None
                 if isinstance(response, list) and len(response) >= 2:
                     self._hip3_meta_cache[dex] = response
-                    # Also cache the meta separately for round_size
-                    # Store as {dex: {"universe": [...]}}
             return self._hip3_meta_cache.get(dex)
         if not self._meta_cache:
             response = await self._retry(self.info.meta_and_asset_ctxs)
@@ -491,20 +646,26 @@ class HyperliquidAPI:
         end_time = int(_time.time() * 1000)
         start_time = end_time - (count * interval_ms)
 
-        if ":" in asset:
-            # HIP-3 asset — SDK candles_snapshot can't resolve dex:asset names,
-            # so use the raw post endpoint directly
-            raw = await self._retry(
-                lambda: self.info.post("/info", {
-                    "type": "candleSnapshot",
-                    "req": {"coin": asset, "interval": interval,
-                            "startTime": start_time, "endTime": end_time}
-                })
-            )
-        else:
-            raw = await self._retry(
-                lambda: self.info.candles_snapshot(asset, interval, start_time, end_time)
-            )
+        try:
+            if ":" in asset:
+                # HIP-3 asset — SDK candles_snapshot can't resolve dex:asset names,
+                # so use the raw post endpoint directly
+                raw = await self._retry(
+                    lambda: self.info.post("/info", {
+                        "type": "candleSnapshot",
+                        "req": {"coin": asset, "interval": interval,
+                                "startTime": start_time, "endTime": end_time}
+                    })
+                )
+            else:
+                raw = await self._retry(
+                    lambda: self.info.candles_snapshot(asset, interval, start_time, end_time)
+                )
+        except KeyError as e:
+            logging.warning("Candle fetch KeyError for %s (hip3=%s): %s", asset, ":" in asset, e)
+            return []
+        if not isinstance(raw, list):
+            return []
         candles = []
         for c in raw:
             candles.append({

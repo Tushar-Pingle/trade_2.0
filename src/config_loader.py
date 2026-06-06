@@ -105,6 +105,10 @@ CONFIG = {
     "api_host": _get_env("API_HOST", "0.0.0.0"),
     "api_port": _get_env("APP_PORT") or _get_env("API_PORT") or "3000",
 
+    # Paper-mode dry-run: writes are simulated in memory, reads stay live
+    "paper_mode": _get_bool("PAPER_MODE", False),
+    "paper_starting_balance": _get_env("PAPER_STARTING_BALANCE", "10000"),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

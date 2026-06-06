@@ -184,6 +184,40 @@ class HyperliquidAPI:
             self._paper_fills = self._paper_fills[-200:]
         return price
 
+    def round_price(self, asset, price):
+        """Round trigger/limit price to a valid Hyperliquid tick.
+
+        Hyperliquid perp prices must satisfy two constraints simultaneously:
+        at most ``6 - szDecimals`` decimal places, and at most 5 significant
+        figures. Applies both, using cached metadata for the asset (or HIP-3
+        dex). Falls back to 5 significant figures only when metadata is absent.
+        """
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            return price
+        if price <= 0:
+            return price
+        sz_decimals = None
+        meta = self._meta_cache[0] if self._meta_cache else None
+        if meta:
+            asset_info = next((u for u in meta.get("universe", []) if u.get("name") == asset), None)
+            if asset_info is not None:
+                sz_decimals = asset_info.get("szDecimals")
+        if sz_decimals is None and ":" in asset:
+            dex = asset.split(":")[0]
+            dex_data = self._hip3_meta_cache.get(dex)
+            if dex_data and isinstance(dex_data, list) and len(dex_data) >= 1:
+                dex_meta = dex_data[0]
+                asset_info = next((u for u in dex_meta.get("universe", []) if u.get("name") == asset), None)
+                if asset_info is not None:
+                    sz_decimals = asset_info.get("szDecimals")
+        sig_rounded = float(f"{price:.5g}")
+        if sz_decimals is None:
+            return sig_rounded
+        max_decimals = max(0, 6 - int(sz_decimals))
+        return round(sig_rounded, max_decimals)
+
     def round_size(self, asset, amount):
         """Round order size to the asset precision defined by market metadata.
 
@@ -310,6 +344,7 @@ class HyperliquidAPI:
             Raw SDK response from `Exchange.order`.
         """
         amount = self.round_size(asset, amount)
+        tp_price = self.round_price(asset, tp_price)
         order_type = {"trigger": {"triggerPx": tp_price, "isMarket": True, "tpsl": "tp"}}
         if self.paper_mode:
             oid = self._next_paper_oid()
@@ -334,6 +369,7 @@ class HyperliquidAPI:
             Raw SDK response from `Exchange.order`.
         """
         amount = self.round_size(asset, amount)
+        sl_price = self.round_price(asset, sl_price)
         order_type = {"trigger": {"triggerPx": sl_price, "isMarket": True, "tpsl": "sl"}}
         if self.paper_mode:
             oid = self._next_paper_oid()

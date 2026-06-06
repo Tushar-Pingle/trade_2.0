@@ -273,6 +273,40 @@ class RiskManager:
 
         return True, "", trade
 
+    def to_dict(self) -> dict:
+        """Serialize daily/circuit-breaker state for persistence."""
+        return {
+            "daily_high_value": self.daily_high_value,
+            "daily_high_date": self.daily_high_date.isoformat() if self.daily_high_date else None,
+            "circuit_breaker_active": self.circuit_breaker_active,
+            "circuit_breaker_date": self.circuit_breaker_date.isoformat() if self.circuit_breaker_date else None,
+        }
+
+    def load_from_dict(self, data: dict) -> None:
+        """Restore daily/circuit-breaker state from a previous persistence snapshot.
+
+        Date strings (ISO 8601) are parsed back into ``date`` objects. Missing
+        or malformed values fall back to defaults (None / False).
+        """
+        if not isinstance(data, dict):
+            return
+        dhv = data.get("daily_high_value")
+        try:
+            self.daily_high_value = float(dhv) if dhv is not None else None
+        except (TypeError, ValueError):
+            self.daily_high_value = None
+        dhd = data.get("daily_high_date")
+        try:
+            self.daily_high_date = datetime.fromisoformat(dhd).date() if dhd else None
+        except (ValueError, TypeError):
+            self.daily_high_date = None
+        self.circuit_breaker_active = bool(data.get("circuit_breaker_active"))
+        cbd = data.get("circuit_breaker_date")
+        try:
+            self.circuit_breaker_date = datetime.fromisoformat(cbd).date() if cbd else None
+        except (ValueError, TypeError):
+            self.circuit_breaker_date = None
+
     def get_risk_summary(self) -> dict:
         """Return current risk parameters for inclusion in LLM context."""
         return {

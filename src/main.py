@@ -85,15 +85,85 @@ def main():
     # HIP-3 dexes whose meta failed to load — assets under these are skipped
     failed_dexes = set()
 
+    state_path = CONFIG.get("state_path") or "state.json"
+    reconcile_grace_seconds = int(CONFIG.get("reconcile_grace_seconds") or 10)
+    adopt_orphans_on_start = bool(CONFIG.get("adopt_orphans_on_start"))
+
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
     def add_event(msg: str):
         """Log an informational event and push it into the recent events deque."""
         logging.info(msg)
 
+    def load_state():
+        """Hydrate persisted state into in-memory structures.
+
+        Idempotent — safe to call on cold start (file absent) or after restart.
+        Mutates: active_trades, trade_log, initial_account_value, price_history,
+        risk_mgr daily/circuit-breaker fields.
+        """
+        nonlocal initial_account_value
+        if not os.path.exists(state_path):
+            return
+        try:
+            with open(state_path, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            add_event(f"State file load failed ({state_path}): {e}; starting fresh")
+            return
+        if not isinstance(data, dict):
+            return
+        for tr in data.get("active_trades") or []:
+            if isinstance(tr, dict) and tr.get("asset"):
+                active_trades.append(tr)
+        for entry in (data.get("trade_log") or [])[-500:]:
+            trade_log.append(entry)
+        iav = data.get("initial_account_value")
+        if iav is not None:
+            try:
+                initial_account_value = float(iav)
+            except (TypeError, ValueError):
+                pass
+        for asset, points in (data.get("price_history") or {}).items():
+            dq = deque(maxlen=60)
+            for p in points[-60:]:
+                if isinstance(p, dict):
+                    dq.append(p)
+            price_history[asset] = dq
+        risk_mgr.load_from_dict(data.get("risk_state") or {})
+        add_event(f"State loaded from {state_path}: {len(active_trades)} active trades, "
+                  f"{len(trade_log)} trade log entries")
+
+    def save_state():
+        """Atomically persist current state to disk.
+
+        Uses os.replace for atomic swap so a crash mid-write can never corrupt
+        the file. Bounded sizes prevent unbounded growth.
+        """
+        try:
+            snapshot = {
+                "version": 1,
+                "active_trades": list(active_trades),
+                "trade_log": list(trade_log)[-500:],
+                "initial_account_value": initial_account_value,
+                "price_history": {
+                    asset: list(dq)[-60:] for asset, dq in price_history.items()
+                },
+                "risk_state": risk_mgr.to_dict(),
+            }
+            tmp_path = state_path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(snapshot, f, default=json_default)
+            os.replace(tmp_path, state_path)
+        except OSError as e:
+            add_event(f"State save failed: {e}")
+
     async def run_loop():
         """Main trading loop that gathers data, calls the agent, and executes trades."""
         nonlocal invocation_count, initial_account_value
+
+        # Rehydrate persisted state before any cycle work
+        load_state()
 
         # Pre-load meta cache for correct order sizing
         await hyperliquid.get_meta_and_ctxs()
@@ -172,9 +242,13 @@ def main():
                             await hyperliquid.place_buy_order(coin, size)
                         await hyperliquid.cancel_all_orders(coin)
                         # Remove from active trades
+                        removed_any = False
                         for tr in active_trades[:]:
                             if tr.get('asset') == coin:
                                 active_trades.remove(tr)
+                                removed_any = True
+                        if removed_any:
+                            save_state()
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -216,29 +290,126 @@ def main():
 
             # Reconcile active trades
             try:
-                assets_with_positions = set()
+                assets_with_positions = {}
                 for pos in state['positions']:
                     try:
-                        if abs(float(pos.get('szi') or 0)) > 0:
-                            assets_with_positions.add(pos.get('coin'))
+                        szi = float(pos.get('szi') or 0)
+                        if abs(szi) > 0:
+                            assets_with_positions[pos.get('coin')] = pos
                     except Exception:
                         continue
                 assets_with_orders = {o.get('coin') for o in (open_orders or []) if o.get('coin')}
+                now_utc = datetime.now(timezone.utc)
+                state_dirty = False
                 for tr in active_trades[:]:
                     asset = tr.get('asset')
-                    if asset not in assets_with_positions and asset not in assets_with_orders:
-                        add_event(f"Reconciling stale active trade for {asset} (no position, no orders)")
-                        active_trades.remove(tr)
+                    if asset in assets_with_positions or asset in assets_with_orders:
+                        continue
+                    # Grace period: skip removal if trade was just opened
+                    opened_at_raw = tr.get('opened_at')
+                    try:
+                        opened_at = datetime.fromisoformat(opened_at_raw) if opened_at_raw else None
+                        if opened_at and opened_at.tzinfo is None:
+                            opened_at = opened_at.replace(tzinfo=timezone.utc)
+                    except (TypeError, ValueError):
+                        opened_at = None
+                    if opened_at is not None and (now_utc - opened_at).total_seconds() < reconcile_grace_seconds:
+                        continue
+                    add_event(f"Reconciling stale active trade for {asset} (no position, no orders)")
+                    active_trades.remove(tr)
+                    state_dirty = True
+                    with open(diary_path, "a") as f:
+                        f.write(json.dumps({
+                            "timestamp": now_utc.isoformat(),
+                            "asset": asset,
+                            "action": "reconcile_close",
+                            "reason": "no_position_no_orders",
+                            "opened_at": tr.get('opened_at')
+                        }) + "\n")
+                # Orphan detection: on-chain position with no active_trades entry
+                tracked_assets = {tr.get('asset') for tr in active_trades}
+                for asset, pos in assets_with_positions.items():
+                    if asset in tracked_assets:
+                        continue
+                    if not adopt_orphans_on_start:
                         with open(diary_path, "a") as f:
                             f.write(json.dumps({
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "timestamp": now_utc.isoformat(),
                                 "asset": asset,
-                                "action": "reconcile_close",
-                                "reason": "no_position_no_orders",
-                                "opened_at": tr.get('opened_at')
+                                "action": "orphan_detected",
+                                "szi": pos.get('szi'),
+                                "entryPx": pos.get('entryPx'),
                             }) + "\n")
-            except Exception:
-                pass
+                        continue
+                    try:
+                        szi = float(pos.get('szi') or 0)
+                        entry_px = float(pos.get('entryPx') or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if szi == 0 or entry_px <= 0:
+                        continue
+                    is_long = szi > 0
+                    current_px = await hyperliquid.get_current_price(asset)
+                    if current_px is None or current_px <= 0:
+                        add_event(f"Orphan {asset}: cannot adopt without current price")
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": now_utc.isoformat(),
+                                "asset": asset,
+                                "action": "orphan_adopt_failed",
+                                "reason": "no_price",
+                            }) + "\n")
+                        continue
+                    sl_pct = risk_mgr.mandatory_sl_pct / 100.0
+                    sl_distance = current_px * sl_pct
+                    tp_distance = sl_distance * 2.0
+                    sl_price = round(current_px - sl_distance, 4) if is_long else round(current_px + sl_distance, 4)
+                    tp_price = round(current_px + tp_distance, 4) if is_long else round(current_px - tp_distance, 4)
+                    size = abs(szi)
+                    tp_oid = None
+                    sl_oid = None
+                    try:
+                        sl_resp = await hyperliquid.place_stop_loss(asset, is_long, size, sl_price)
+                        sl_oids = hyperliquid.extract_oids(sl_resp)
+                        sl_oid = sl_oids[0] if sl_oids else None
+                    except Exception as e:
+                        add_event(f"Orphan {asset}: SL placement failed: {e}")
+                    try:
+                        tp_resp = await hyperliquid.place_take_profit(asset, is_long, size, tp_price)
+                        tp_oids = hyperliquid.extract_oids(tp_resp)
+                        tp_oid = tp_oids[0] if tp_oids else None
+                    except Exception as e:
+                        add_event(f"Orphan {asset}: TP placement failed: {e}")
+                    active_trades.append({
+                        "asset": asset,
+                        "is_long": is_long,
+                        "amount": size,
+                        "entry_price": entry_px,
+                        "tp_oid": tp_oid,
+                        "sl_oid": sl_oid,
+                        "exit_plan": "adopted_orphan",
+                        "kind": "adopted",
+                        "opened_at": now_utc.isoformat(),
+                    })
+                    state_dirty = True
+                    add_event(f"Orphan adopted {asset} szi={szi} entry={entry_px} sl={sl_price} tp={tp_price}")
+                    with open(diary_path, "a") as f:
+                        f.write(json.dumps({
+                            "timestamp": now_utc.isoformat(),
+                            "asset": asset,
+                            "action": "orphan_adopted",
+                            "is_long": is_long,
+                            "szi": szi,
+                            "entry_price": entry_px,
+                            "sl_price": sl_price,
+                            "tp_price": tp_price,
+                            "sl_oid": sl_oid,
+                            "tp_oid": tp_oid,
+                        }) + "\n")
+                if state_dirty:
+                    save_state()
+            except Exception as e:
+                add_event(f"Reconcile error: {e}")
 
             recent_fills_struct = []
             try:
@@ -562,6 +733,7 @@ def main():
                             "exit_plan": output["exit_plan"],
                             "opened_at": datetime.now(timezone.utc).isoformat()
                         })
+                        save_state()
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
                         if rationale:
                             add_event(f"Post-trade rationale for {asset}: {rationale}")
@@ -602,6 +774,9 @@ def main():
                     import traceback
                     add_event(f"Execution error {asset}: {e}")
                     add_event(f"Traceback: {traceback.format_exc()}")
+
+            # Persist end-of-cycle state (captures risk_mgr daily watermark updates)
+            save_state()
 
             await asyncio.sleep(get_interval_seconds(args.interval))
 

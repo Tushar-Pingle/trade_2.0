@@ -109,6 +109,11 @@ CONFIG = {
     "paper_mode": _get_bool("PAPER_MODE", False),
     "paper_starting_balance": _get_env("PAPER_STARTING_BALANCE", "10000"),
 
+    # State persistence
+    "state_path": _get_env("STATE_PATH", "state.json"),
+    "reconcile_grace_seconds": _get_int("RECONCILE_GRACE_SECONDS", 10),
+    "adopt_orphans_on_start": _get_bool("ADOPT_ORPHANS_ON_START", True),
+
     # Legacy / optional
     "taapi_api_key": _get_env("TAAPI_API_KEY"),
     "openrouter_api_key": _get_env("OPENROUTER_API_KEY"),

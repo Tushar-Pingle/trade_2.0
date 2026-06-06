@@ -47,10 +47,13 @@ def main():
     parser = argparse.ArgumentParser(description="LLM-based Trading Agent on Hyperliquid")
     parser.add_argument("--assets", type=str, nargs="+", required=False, help="Assets to trade, e.g., BTC ETH")
     parser.add_argument("--interval", type=str, required=False, help="Interval period, e.g., 1h")
+    parser.add_argument("--paper", action="store_true", help="Paper-mode dry run: writes simulated, reads live")
     args = parser.parse_args()
 
     # Allow assets/interval via .env (CONFIG) if CLI not provided
     from src.config_loader import CONFIG
+    if args.paper:
+        CONFIG["paper_mode"] = True
     assets_env = CONFIG.get("assets")
     interval_env = CONFIG.get("interval")
     if (not args.assets or len(args.assets) == 0) and assets_env:
@@ -79,6 +82,8 @@ def main():
     initial_account_value = None
     # Perp mid-price history sampled each loop (authoritative, avoids spot/perp basis mismatch)
     price_history = {}
+    # HIP-3 dexes whose meta failed to load — assets under these are skipped
+    failed_dexes = set()
 
     print(f"Starting trading agent for assets: {args.assets} at interval: {args.interval}")
 
@@ -98,8 +103,30 @@ def main():
             if ":" in a:
                 hip3_dexes.add(a.split(":")[0])
         for dex in hip3_dexes:
-            await hyperliquid.get_meta_and_ctxs(dex=dex)
-            add_event(f"Loaded HIP-3 meta for dex: {dex}")
+            try:
+                meta = await hyperliquid.get_meta_and_ctxs(dex=dex)
+                if meta is None:
+                    failed_dexes.add(dex)
+                    add_event(f"HIP-3 meta unavailable for dex: {dex}")
+                    with open(diary_path, "a") as f:
+                        f.write(json.dumps({
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "action": "hip3_meta_load_failed",
+                            "dex": dex,
+                            "error": "meta_returned_none",
+                        }) + "\n")
+                else:
+                    add_event(f"Loaded HIP-3 meta for dex: {dex}")
+            except Exception as e:
+                failed_dexes.add(dex)
+                add_event(f"HIP-3 meta load failed for dex {dex}: {e}")
+                with open(diary_path, "a") as f:
+                    f.write(json.dumps({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "action": "hip3_meta_load_failed",
+                        "dex": dex,
+                        "error": str(e),
+                    }) + "\n")
 
         while True:
             invocation_count += 1
@@ -270,8 +297,21 @@ def main():
             asset_prices = {}
             for asset in args.assets:
                 try:
+                    if ":" in asset and asset.split(":")[0] in failed_dexes:
+                        add_event(f"Skipping {asset}: HIP-3 dex meta unavailable")
+                        continue
                     current_price = await hyperliquid.get_current_price(asset)
                     asset_prices[asset] = current_price
+                    if current_price is None or current_price <= 0:
+                        add_event(f"Skipping {asset}: no current price available")
+                        with open(diary_path, "a") as f:
+                            f.write(json.dumps({
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                                "asset": asset,
+                                "action": "skip_no_price",
+                                "phase": "data_gather",
+                            }) + "\n")
+                        continue
                     if asset not in price_history:
                         price_history[asset] = deque(maxlen=60)
                     price_history[asset].append({"t": datetime.now(timezone.utc).isoformat(), "mid": round_or_none(current_price, 2)})
@@ -434,6 +474,19 @@ def main():
                             add_event(f"Holding {asset}: zero/negative allocation")
                             continue
 
+                        # Hard guard: never divide by zero / None / negative price
+                        if current_price is None or current_price <= 0:
+                            add_event(f"SKIP {asset}: no current price (current_price={current_price})")
+                            with open(diary_path, "a") as f:
+                                f.write(json.dumps({
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    "asset": asset,
+                                    "action": "skip_no_price",
+                                    "phase": "execution",
+                                    "allocation_usd": alloc_usd,
+                                }) + "\n")
+                            continue
+
                         # --- RISK: Validate trade before execution ---
                         output["current_price"] = current_price
                         allowed, reason, output = risk_mgr.validate_trade(
@@ -507,7 +560,7 @@ def main():
                             "tp_oid": tp_oid,
                             "sl_oid": sl_oid,
                             "exit_plan": output["exit_plan"],
-                            "opened_at": datetime.now().isoformat()
+                            "opened_at": datetime.now(timezone.utc).isoformat()
                         })
                         add_event(f"{action.upper()} {asset} amount {amount:.4f} at ~{current_price}")
                         if rationale:
